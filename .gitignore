@@ -1,0 +1,36 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Game runtime
+run/
+logs/
+*.log
+
+# Compiled classes
+bin/
+out/
+
+# Local backups
+archives/
+
+# Backup files
+*.bak
+*.orig
+
+# Gradle wrapper properties (optional - commit if you want reproducible builds)
+# gradle/wrapper/gradle-wrapper.properties
