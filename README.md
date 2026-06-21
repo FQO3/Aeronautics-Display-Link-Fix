@@ -1,4 +1,5 @@
 ﻿# Aeronautics Display Link Fix [ADLF]
+# 航空学显示链接器修复 [ADLF]
 
 [中文](#chinese) | [English](#english)
 
@@ -50,7 +51,10 @@ cd Aeronautics-display-link-fix
 - 🧠 **本项目由 AI辅助编写**，代码结构和实现细节由 AI 辅助生成。
 - 🔧 由于作者不保证持续维护，后续版本兼容性可能滞后。
 - 🏢 **Create / Sable / Aeronautics 官方未来可能会在架构层面修复此 Bug**，届时本 Mod 将不再需要。请关注官方更新日志。
+### 已知问题
 
+- 无法处理旋转后Offset（下版本修复）
+- 显示目标物理化/去物理化无法追踪（不一定会修复）
 ---
 
 ## English
