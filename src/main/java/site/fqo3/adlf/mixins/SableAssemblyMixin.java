@@ -7,66 +7,91 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtUtils;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import org.slf4j.Logger;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import site.fqo3.adlf.config.AdlfConfig;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 两步法修复 DisplayLink TargetOffset 在 Case 3（DL 和广告牌同步组装）时被错误变换的问题。
- *
- * Phase 1 (loadWithComponents 之前):
- *   检测 DL 的目标方块是否在同一组装中 → 保存 Tag 中的 newPos + 原始 offset 到列表
- * Phase 2 (moveBlocks 尾部):
- *   对每项在 dest 世界取 BE → 检查 offset 是否已变化 → 若变化则恢复原始值
+ * Two-phase fix for DisplayLink TargetOffset corruption during Sable
+ * assembly/disassembly when both the DisplayLink and its target sign
+ * are on the same structure (Case 3).
+ * <p>
+ * Phase 1 (before loadWithComponents):
+ *   Detects Case 3 → saves (newPosFromTag, savedOffset).
+ * Phase 2 (TAIL):
+ *   Uses tag x/y/z for accurate BE lookup. Corrected offset is computed
+ *   as {@code savedOffset.rotate(transform.getRotation())} — pure integer
+ *   math, no floating-point rounding.
+ * <p>
+ * All INFO logs are gated by {@link AdlfConfig#debugLogging()}.
  */
 @Mixin(value = SubLevelAssemblyHelper.class, remap = false)
 public class SableAssemblyMixin {
 
     private static final Logger LOGGER = LogUtils.getLogger();
 
-    // 三组平行列表，用索引关联（避免内部类触发 Mixin 包隔离限制）
+    // ── Two parallel ThreadLocals (avoid inner-class Mixin package isolation) ──
+    /** Tag x/y/z written by Sable — accurate destination position for BE lookup. */
     private static final ThreadLocal<List<BlockPos>> LIST_NEWPOS = new ThreadLocal<>();
+    /** Original relative offset from DL to its target sign. */
     private static final ThreadLocal<List<BlockPos>> LIST_OFFSET = new ThreadLocal<>();
-    private static final ThreadLocal<List<String>> LIST_DEBUG = new ThreadLocal<>(); // 调试
 
-    // ============================================================
-    //  Phase 1: loadWithComponents 调用前，检测 Case 3 并保存数据
-    // ============================================================
+    // ════════════════════════════════════════════════════════════
+    //  Conditional logging helpers
+    // ════════════════════════════════════════════════════════════
+
+    private static void logDebug(String msg, Object... args) {
+        if (AdlfConfig.debugLogging()) {
+            LOGGER.info(msg, args);
+        }
+    }
+
+    private static void logError(String msg, Object... args) {
+        LOGGER.error(msg, args);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Phase 1: before loadWithComponents
+    // ════════════════════════════════════════════════════════════
+
     @Inject(method = "moveBlocks", at = @At(value = "INVOKE",
-            target = "Lnet/minecraft/world/level/block/entity/BlockEntity;loadWithComponents(Lnet/minecraft/nbt/CompoundTag;Lnet/minecraft/core/HolderLookup$Provider;)V",
+            target = "Lnet/minecraft/world/level/block/entity/BlockEntity;"
+                   + "loadWithComponents(Lnet/minecraft/nbt/CompoundTag;"
+                   + "Lnet/minecraft/core/HolderLookup$Provider;)V",
             shift = At.Shift.BEFORE), remap = false)
     private static void phase1Before(ServerLevel level, SubLevelAssemblyHelper.AssemblyTransform transform,
             Iterable<BlockPos> blocks, CallbackInfo ci,
             @Local(ordinal = 0) BlockPos block,
             @Local(ordinal = 0) CompoundTag tag) {
 
-        // ── 判断是否为 DisplayLink ──
+        // ── Is this a DisplayLink? ──
         String id = tag.getString("id");
         if (id == null || !id.contains("display_link")) {
             return;
         }
 
-        // ── 从 tag 读取 TargetOffset ──
+        // ── Read TargetOffset from tag ──
         BlockPos savedOffset = NbtUtils.readBlockPos(tag, "TargetOffset").orElse(BlockPos.ZERO);
         if (BlockPos.ZERO.equals(savedOffset)) {
-            LOGGER.info("[ADLF=P1] DisplayLink 但 TargetOffset 为零，跳过。block={}", block);
+            logDebug("[ADLF=P1] DisplayLink with zero TargetOffset, skip. block={}", block);
             return;
         }
 
-        // ── 双层判定：区分 Case 1/2/3 ──
-        // 第一层：target 方块在 blocks 列表中 → Case 3 正向（方块→物理化）
-        // 第二层：block 是子世界坐标（大数字）+ offset 小 → Case 3 反向（物理化→方块）
+        // ── Case 3 detection ──
+        BlockPos targetPos = block.offset(savedOffset);
         boolean case3Forward = false;
         int totalBlocks = 0;
         for (BlockPos bp : blocks) {
             totalBlocks++;
-            if (bp.equals(block.offset(savedOffset))) {
+            if (bp.distManhattan(targetPos) <= 2) {
                 case3Forward = true;
                 break;
             }
@@ -79,42 +104,39 @@ public class SableAssemblyMixin {
                            && Math.abs(savedOffset.getZ()) < 1000;
         boolean case3Reverse = !case3Forward && bigBlockCoords && smallOffset;
 
-        LOGGER.info("[ADLF=P1] DL @ block={}, offset={}, blocks总数={}, case3Forward={}, case3Reverse={}",
+        logDebug("[ADLF=P1] DL @ block={}, offset={}, blocks={}, forward={}, reverse={}",
                 block, savedOffset, totalBlocks, case3Forward, case3Reverse);
 
         if (!case3Forward && !case3Reverse) {
-            LOGGER.info("[ADLF=P1] 非 Case 3，跳过");
+            logDebug("[ADLF=P1] Not Case 3, skip");
             return;
         }
 
-        // ── 从 tag 的 x/y/z 读取 newPos（Sable 已将坐标写进 tag）──
+        // ── Read tag x/y/z — Sable's ground truth for destination position ──
         BlockPos newPosFromTag = new BlockPos(tag.getInt("x"), tag.getInt("y"), tag.getInt("z"));
 
-        LOGGER.info("[ADLF=P1] ★ 检测到 Case 3！tag.newPos={}, savedOffset={}", newPosFromTag, savedOffset);
-        LOGGER.info("[ADLF=P1]    原始 block={}，offset={}", block, savedOffset);
+        logDebug("[ADLF=P1] ★ Case 3 detected! block={}, tagPos={}, offset={}",
+                block, newPosFromTag, savedOffset);
 
-        // ── 存入三组平行列表 ──
+        // ── Store in parallel lists ──
         List<BlockPos> npList = LIST_NEWPOS.get();
         List<BlockPos> offList = LIST_OFFSET.get();
-        List<String> dbgList = LIST_DEBUG.get();
         if (npList == null) {
             npList = new ArrayList<>();
             offList = new ArrayList<>();
-            dbgList = new ArrayList<>();
             LIST_NEWPOS.set(npList);
             LIST_OFFSET.set(offList);
-            LIST_DEBUG.set(dbgList);
         }
         npList.add(newPosFromTag);
         offList.add(savedOffset);
-        dbgList.add(block.toShortString() + "→" + newPosFromTag.toShortString());
 
-        LOGGER.info("[ADLF=P1] 已缓存: 列表大小={}", npList.size());
+        logDebug("[ADLF=P1] Cached: size={}", npList.size());
     }
 
-    // ============================================================
-    //  Phase 2: moveBlocks 尾部，恢复 offset
-    // ============================================================
+    // ════════════════════════════════════════════════════════════
+    //  Phase 2: TAIL — rotation-aware offset correction
+    // ════════════════════════════════════════════════════════════
+
     @Inject(method = "moveBlocks", at = @At("TAIL"), remap = false)
     private static void phase2Tail(ServerLevel level, SubLevelAssemblyHelper.AssemblyTransform transform,
             Iterable<BlockPos> blocks, CallbackInfo ci) {
@@ -122,41 +144,52 @@ public class SableAssemblyMixin {
         List<BlockPos> npList = LIST_NEWPOS.get();
         if (npList == null || npList.isEmpty()) return;
         List<BlockPos> offList = LIST_OFFSET.get();
-        List<String> dbgList = LIST_DEBUG.get();
-        LIST_NEWPOS.remove(); LIST_OFFSET.remove(); LIST_DEBUG.remove();
+        LIST_NEWPOS.remove();
+        LIST_OFFSET.remove();
 
         int total = npList.size();
-        LOGGER.info("[ADLF=P2] ═══ TAIL 开始，需要修复 {} 个 DL ═══", total);
+        logDebug("[ADLF=P2] ═══ TAIL start, {} DL(s) to fix ═══", total);
         ServerLevel dest = transform.getLevel();
+        Rotation rot = transform.getRotation();
 
         int fixed = 0, alreadyOk = 0, notFound = 0;
         for (int i = 0; i < total; i++) {
-            BlockPos newPos = npList.get(i);
+            BlockPos newDLPos = npList.get(i);       // tag x/y/z — accurate position
             BlockPos savedOffset = offList.get(i);
             try {
-                BlockEntity be = dest.getBlockEntity(newPos);
+                // ── Rotation-aware corrected offset (exact integer math) ──
+                BlockPos correctedOffset = savedOffset.rotate(rot);
+
+                // ── Look up BE using tag coordinates ──
+                BlockEntity be = dest.getBlockEntity(newDLPos);
                 if (be == null) {
-                    LOGGER.warn("[ADLF=P2] ✗ 未找到 BE！newPos={}", newPos);
-                    notFound++; continue;
+                    logDebug("[ADLF=P2] ✗ BE not found! tagPos={}", newDLPos);
+                    notFound++;
+                    continue;
                 }
+
                 CompoundTag nbt = be.saveWithFullMetadata(dest.registryAccess());
                 BlockPos currentOffset = NbtUtils.readBlockPos(nbt, "TargetOffset").orElse(BlockPos.ZERO);
-                LOGGER.info("[ADLF=P2] [{}/{}] newPos={}, 当前offset={}, 原始offset={}",
-                        i + 1, total, newPos, currentOffset, savedOffset);
-                if (!currentOffset.equals(savedOffset)) {
-                    nbt.put("TargetOffset", NbtUtils.writeBlockPos(savedOffset));
+
+                logDebug("[ADLF=P2] [{}/{}] tagPos={}, savedOffset={}, rot={}",
+                        i + 1, total, newDLPos, savedOffset, rot);
+                logDebug("[ADLF=P2]         correctedOffset={}, currentOffset={}",
+                        correctedOffset, currentOffset);
+
+                if (!currentOffset.equals(correctedOffset)) {
+                    nbt.put("TargetOffset", NbtUtils.writeBlockPos(correctedOffset));
                     be.loadWithComponents(nbt, dest.registryAccess());
-                    LOGGER.info("[ADLF=P2] ✓ 已修复！{} → {}", currentOffset, savedOffset);
+                    logDebug("[ADLF=P2] ✓ Fixed! {} → {}", currentOffset, correctedOffset);
                     fixed++;
                 } else {
-                    LOGGER.info("[ADLF=P2] offset 未变化，无需修复");
+                    logDebug("[ADLF=P2] offset unchanged, skip");
                     alreadyOk++;
                 }
             } catch (Exception e) {
-                LOGGER.error("[ADLF=P2] ✗ 异常: newPos={}", newPos, e);
+                logError("[ADLF=P2] ✗ Exception: tagPos={}", newDLPos, e);
             }
         }
-        LOGGER.info("[ADLF=P2] ═══ TAIL 完成: 修复={}, 不需要={}, 未找到={}, 总计={} ═══",
+        logDebug("[ADLF=P2] ═══ TAIL done: fixed={}, ok={}, notFound={}, total={} ═══",
                 fixed, alreadyOk, notFound, total);
     }
 }
