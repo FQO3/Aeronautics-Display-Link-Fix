@@ -13,6 +13,9 @@ build/
 *.swo
 *~
 
+# PS
+.ps/
+
 # macOS
 .DS_Store
 
